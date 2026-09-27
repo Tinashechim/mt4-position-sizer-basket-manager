@@ -27,6 +27,8 @@
 double panel_scale        = 1.0;
 double auto_panel_scale   = 1.0;
 double manual_panel_scale = 1.0;
+bool manual_scale_override = false;
+
 
 bool   risk_percentage_mode = true;
 bool   daily_percentage_mode = true;
@@ -936,11 +938,11 @@ int UnitX()
 
 int FontSize(int base_size)
 {
-   // 20% larger baseline than the original panel.
+   // 30% larger baseline than the original panel.
    int size =
       (int)MathRound(
          base_size *
-         1.20 *
+         1.30 *
          panel_scale
       );
 
@@ -971,7 +973,6 @@ void CalculatePanelScale()
       chart_height <= 0
    )
    {
-      auto_panel_scale = 1.0;
       panel_scale = manual_panel_scale;
       return;
    }
@@ -1002,18 +1003,25 @@ void CalculatePanelScale()
          height_scale
       );
 
-   if(auto_panel_scale > 1.0)
-      auto_panel_scale = 1.0;
+   if(auto_panel_scale < 0.25)
+      auto_panel_scale = 0.25;
 
-   if(auto_panel_scale < 0.50)
-      auto_panel_scale = 0.50;
+   if(auto_panel_scale > 1.50)
+      auto_panel_scale = 1.50;
 
-   panel_scale =
-      auto_panel_scale *
-      manual_panel_scale;
+   // Before the user presses +/- the panel automatically fits the chart.
+   // After +/- is pressed, the user's requested scale takes priority so
+   // every click produces a visible 10% size change.
+   if(manual_scale_override)
+      panel_scale = manual_panel_scale;
+   else
+      panel_scale = MathMin(
+         manual_panel_scale,
+         auto_panel_scale
+      );
 
-   if(panel_scale < 0.25)
-      panel_scale = 0.25;
+   if(panel_scale < 0.50)
+      panel_scale = 0.50;
 
    if(panel_scale > 1.50)
       panel_scale = 1.50;
@@ -1147,7 +1155,7 @@ void CreateButton(
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
    ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
    ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
-   ObjectSetInteger(0, name, OBJPROP_ZORDER, 2);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER, 20);
 }
 
 void CreateEdit(
@@ -1200,6 +1208,7 @@ void DeleteStopLossLine()
       0,
       "PSBM_SL_LINE"
    );
+
 }
 
 void CreateStopLossLine()
@@ -1251,6 +1260,8 @@ void CreateStopLossLine()
    ))
       return;
 
+   // Keep the SL line a normal red MT4 horizontal price line.
+   // OBJ_HLINE displays its price on the chart's price scale/grid.
    ObjectSetInteger(0, "PSBM_SL_LINE", OBJPROP_COLOR, clrRed);
    ObjectSetInteger(0, "PSBM_SL_LINE", OBJPROP_WIDTH, 2);
    ObjectSetInteger(0, "PSBM_SL_LINE", OBJPROP_STYLE, STYLE_SOLID);
@@ -1258,6 +1269,7 @@ void CreateStopLossLine()
    ObjectSetInteger(0, "PSBM_SL_LINE", OBJPROP_SELECTED, true);
    ObjectSetInteger(0, "PSBM_SL_LINE", OBJPROP_BACK, true);
    ObjectSetInteger(0, "PSBM_SL_LINE", OBJPROP_HIDDEN, true);
+
 }
 
 void UpdateStopLossFromLine()
@@ -1271,28 +1283,47 @@ void UpdateStopLossFromLine()
    )
       return;
 
-   double price =
+   // This is the exact price where the user dropped the line.
+   double dropped_price =
       ObjectGetDouble(
          0,
          "PSBM_SL_LINE",
          OBJPROP_PRICE1
       );
 
-   price =
+   // Apply the CURRENT spread once after the drag is completed.
+   double spread_price =
+      CurrentAsk() - CurrentBid();
+
+   if(spread_price < 0.0)
+      spread_price = 0.0;
+
+   double adjusted_price =
       NormalizeDouble(
-         price,
+         dropped_price + spread_price,
          PriceDigits()
       );
 
+   // Move the visual SL line to the spread-adjusted price.
+   ObjectSetDouble(
+      0,
+      "PSBM_SL_LINE",
+      OBJPROP_PRICE1,
+      adjusted_price
+   );
+
+   // Keep the panel synchronized with the final adjusted price.
    ObjectSetString(
       0,
       "PSBM_SL_EDIT",
       OBJPROP_TEXT,
       DoubleToString(
-         price,
+         adjusted_price,
          PriceDigits()
       )
    );
+
+   ChartRedraw();
 }
 
 void UpdateStopLossLineFromInput()
@@ -1300,7 +1331,7 @@ void UpdateStopLossLineFromInput()
    if(!sl_line_enabled)
       return;
 
-   double price =
+   double entered_price =
       StringToDouble(
          ObjectGetString(
             0,
@@ -1309,8 +1340,33 @@ void UpdateStopLossLineFromInput()
          )
       );
 
-   if(price <= 0.0)
+   if(entered_price <= 0.0)
       return;
+
+   // Automatically add the CURRENT spread to the SL price entered
+   // in the panel. Spread price = Ask - Bid.
+   double spread_price =
+      CurrentAsk() - CurrentBid();
+
+   if(spread_price < 0.0)
+      spread_price = 0.0;
+
+   double adjusted_price =
+      NormalizeDouble(
+         entered_price + spread_price,
+         PriceDigits()
+      );
+
+   // Show the spread-adjusted SL in the panel as well.
+   ObjectSetString(
+      0,
+      "PSBM_SL_EDIT",
+      OBJPROP_TEXT,
+      DoubleToString(
+         adjusted_price,
+         PriceDigits()
+      )
+   );
 
    if(ObjectFind(
       0,
@@ -1318,18 +1374,16 @@ void UpdateStopLossLineFromInput()
    ) < 0)
    {
       CreateStopLossLine();
-      return;
    }
 
    ObjectSetDouble(
       0,
       "PSBM_SL_LINE",
       OBJPROP_PRICE1,
-      NormalizeDouble(
-         price,
-         PriceDigits()
-      )
+      adjusted_price
    );
+
+   ChartRedraw();
 }
 
 void UpdateSLButton()
@@ -1383,6 +1437,14 @@ void DeletePanelObjects()
 
 void CreatePanel()
 {
+   // Remove scrollbar objects left behind by any older EA build.
+   ObjectDelete(0, "PSBM_SCROLL_TRACK");
+   ObjectDelete(0, "PSBM_SCROLL_THUMB");
+   ObjectDelete(0, "PSBM_SCROLL_LEFT");
+   ObjectDelete(0, "PSBM_SCROLL_RIGHT");
+   ObjectDelete(0, "PSBM_SCROLL_UP");
+   ObjectDelete(0, "PSBM_SCROLL_DOWN");
+
    CalculatePanelScale();
 
    string currency =
@@ -1427,6 +1489,18 @@ void CreatePanel()
       clrWhite
    );
 
+   // Close/remove this EA from the chart.
+   // This does NOT close any trading positions.
+   CreateButton(
+      "PSBM_CLOSE_BUTTON",
+      "X",
+      px + pw - S(25),
+      py + S(5),
+      S(18),
+      S(18),
+      C'110,55,55'
+   );
+
    CreateLabel(
       "PSBM_SUBTITLE",
       "Account-wide manual trade management",
@@ -1440,10 +1514,10 @@ void CreatePanel()
    CreateButton(
       "PSBM_SCALE_MINUS",
       "-",
-      px + S(216),
-      py + S(22),
-      S(18),
-      S(17),
+      px + S(184),
+      py + S(21),
+      S(24),
+      S(20),
       C'55,60,70'
    );
 
@@ -1451,11 +1525,11 @@ void CreatePanel()
       "PSBM_SCALE_VALUE",
       IntegerToString(
          (int)MathRound(
-            manual_panel_scale *
+            panel_scale *
             100.0
          )
       ) + "%",
-      px + S(237),
+      px + S(211),
       py + S(25),
       FontSize(BASE_FONT_SMALL),
       C'200,205,215'
@@ -1464,11 +1538,42 @@ void CreatePanel()
    CreateButton(
       "PSBM_SCALE_PLUS",
       "+",
-      px + S(276),
-      py + S(22),
-      S(18),
-      S(17),
+      px + S(258),
+      py + S(21),
+      S(24),
+      S(20),
       C'55,60,70'
+   );
+
+
+   // SECTION BOUNDARIES
+   // Each major subject has its own visible border.
+   CreateRectangle(
+      "PSBM_CURRENT_BORDER",
+      px + S(6), py + S(46),
+      pw - S(12), S(101),
+      C'25,28,35', C'70,75,85'
+   );
+
+   CreateRectangle(
+      "PSBM_CARRY_BORDER",
+      px + S(6), py + S(153),
+      pw - S(12), S(79),
+      C'25,28,35', C'70,75,85'
+   );
+
+   CreateRectangle(
+      "PSBM_DAILY_BORDER",
+      px + S(6), py + S(241),
+      pw - S(12), S(145),
+      C'25,28,35', C'70,75,85'
+   );
+
+   CreateRectangle(
+      "PSBM_SIZER_BORDER",
+      px + S(6), py + S(397),
+      pw - S(12), S(311),
+      C'25,28,35', C'70,75,85'
    );
 
 
@@ -1705,6 +1810,47 @@ void CreatePanel()
    ChartRedraw();
 }
 
+void SyncStopLossLineWithoutSpread()
+{
+   if(!sl_line_enabled)
+      return;
+
+   double price =
+      StringToDouble(
+         ObjectGetString(
+            0,
+            "PSBM_SL_EDIT",
+            OBJPROP_TEXT
+         )
+      );
+
+   if(price <= 0.0)
+      return;
+
+   if(ObjectFind(0, "PSBM_SL_LINE") < 0)
+      CreateStopLossLine();
+
+   ObjectSetDouble(
+      0,
+      "PSBM_SL_LINE",
+      OBJPROP_PRICE1,
+      NormalizeDouble(
+         price,
+         PriceDigits()
+      )
+   );
+
+   // The SL line remains red. Rebuilding/scrolling the panel must
+   // never apply the spread a second time.
+   ObjectSetInteger(
+      0,
+      "PSBM_SL_LINE",
+      OBJPROP_COLOR,
+      clrRed
+   );
+}
+
+
 void RebuildResponsivePanel()
 {
    // Preserve current editable values before rebuilding.
@@ -1741,7 +1887,7 @@ void RebuildResponsivePanel()
       ObjectSetString(0, "PSBM_DAILY_TARGET_EDIT", OBJPROP_TEXT, daily_text);
 
    if(sl_line_enabled)
-      UpdateStopLossLineFromInput();
+      SyncStopLossLineWithoutSpread();
 
    ChartRedraw();
 }
@@ -1912,6 +2058,10 @@ void UpdatePanel()
 
 int OnInit()
 {
+
+   // Start from a clean panel state, including objects from older versions.
+   DeletePanelObjects();
+
    BuildGlobalVariableNames();
    LoadSharedSettings();
 
@@ -1942,6 +2092,14 @@ int OnInit()
 
 void OnDeinit(const int reason)
 {
+   // Always restore normal MT4 chart mouse scrolling.
+   ChartSetInteger(
+      0,
+      CHART_MOUSE_SCROLL,
+      true
+   );
+
+
    EventKillTimer();
 
    DeletePanelObjects();
@@ -1995,7 +2153,7 @@ void OnChartEvent(
    const string &sparam
 )
 {
-   // Re-fit panel when chart/monitor dimensions change.
+   // Automatically re-fit the complete panel when chart/monitor dimensions change.
    if(id == CHARTEVENT_CHART_CHANGE)
    {
       RebuildResponsivePanel();
@@ -2076,9 +2234,27 @@ void OnChartEvent(
       return;
 
 
+   // CLOSE / REMOVE EA FROM THIS CHART
+   // Trades remain untouched.
+   if(sparam == "PSBM_CLOSE_BUTTON")
+   {
+      ObjectSetInteger(
+         0,
+         sparam,
+         OBJPROP_STATE,
+         false
+      );
+
+      ExpertRemove();
+      return;
+   }
+
+
    // PANEL SCALE -
    if(sparam == "PSBM_SCALE_MINUS")
    {
+      manual_scale_override = true;
+
       ObjectSetInteger(
          0,
          sparam,
@@ -2104,6 +2280,8 @@ void OnChartEvent(
    // PANEL SCALE +
    if(sparam == "PSBM_SCALE_PLUS")
    {
+      manual_scale_override = true;
+
       ObjectSetInteger(
          0,
          sparam,
