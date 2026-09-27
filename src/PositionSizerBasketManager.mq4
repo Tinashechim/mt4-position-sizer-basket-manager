@@ -1,19 +1,19 @@
 #property strict
-#property version   "2.00"
+#property version   "2.13"
 #property description "Position Sizer & Basket Manager for MT4"
 #property copyright "Tinashe Chimanikire"
 
 // ============================================================
 // MT4 POSITION SIZER & BASKET MANAGER
 // Session boundary: 23:30 broker/server time
-// Individual broker stop losses are NEVER changed by this EA.
-// The red SL line is visual/calculation only.
+// The EA can execute BUY/SELL market orders from the panel.
+// The selected SL becomes the actual broker stop loss for panel-executed trades.
 // ============================================================
 
 #define BASE_PANEL_X       12
 #define BASE_PANEL_Y       16
 #define BASE_PANEL_WIDTH   304
-#define BASE_PANEL_HEIGHT  722
+#define BASE_PANEL_HEIGHT  790
 
 #define BASE_LABEL_X       11
 #define BASE_VALUE_X       160
@@ -31,6 +31,13 @@ bool manual_scale_override = false;
 
 
 bool   risk_percentage_mode = true;
+bool   risk_includes_costs = true;
+
+// Estimated ROUND-TRIP commission per 1.00 lot.
+// FTMO ETHUSD example supplied during testing:
+// 36.42 commission / 2.11 lots = approximately 17.26 per lot.
+// Change this value if the broker/symbol/account commission differs.
+double estimated_round_trip_commission_per_lot = 17.26;
 bool   daily_percentage_mode = true;
 bool   sl_line_enabled = true;
 
@@ -867,6 +874,337 @@ void CalculatePositionSize()
 }
 
 
+
+// ============================================================
+// COST-AWARE RISK
+// ============================================================
+
+double GetPlannedLossPerLot(double entry,double stop)
+{
+   double market_loss=GetOneLotLoss(entry,stop);
+
+   if(market_loss<=0.0)
+      return 0.0;
+
+   if(!risk_includes_costs)
+      return market_loss;
+
+   return market_loss+
+          MathMax(0.0,estimated_round_trip_commission_per_lot);
+}
+
+
+// ============================================================
+// PANEL TRADE EXECUTION
+// ============================================================
+
+double NormalizeExecutableVolume(double volume)
+{
+   double step = MarketInfo(Symbol(), MODE_LOTSTEP);
+   double min_lot = MarketInfo(Symbol(), MODE_MINLOT);
+   double max_lot = MarketInfo(Symbol(), MODE_MAXLOT);
+
+   if(step <= 0.0 || min_lot <= 0.0 || max_lot <= 0.0)
+      return 0.0;
+
+   double normalized =
+      MathFloor(volume / step) * step;
+
+   normalized = NormalizeDouble(normalized, 8);
+
+   if(normalized < min_lot)
+      return 0.0;
+
+   // Do not silently cap the user's risk calculation.
+   // If the required size exceeds the broker maximum, reject execution.
+   if(normalized > max_lot)
+      return -1.0;
+
+   return normalized;
+}
+
+
+bool ValidateBrokerStopDistance(
+   int order_type,
+   double entry,
+   double stop
+)
+{
+   double point = PointSize();
+
+   if(point <= 0.0)
+      return false;
+
+   double minimum_distance =
+      MarketInfo(Symbol(), MODE_STOPLEVEL) *
+      point;
+
+   if(order_type == OP_BUY)
+   {
+      if(stop >= entry)
+         return false;
+
+      if(minimum_distance > 0.0 &&
+         entry - stop < minimum_distance)
+         return false;
+   }
+   else
+   {
+      if(stop <= entry)
+         return false;
+
+      if(minimum_distance > 0.0 &&
+         stop - entry < minimum_distance)
+         return false;
+   }
+
+   return true;
+}
+
+
+void ExecutePanelTrade(int order_type)
+{
+   RefreshRates();
+
+   double entry =
+      (order_type == OP_BUY)
+      ? CurrentAsk()
+      : CurrentBid();
+
+   double stop =
+      StringToDouble(
+         ObjectGetString(
+            0,
+            "PSBM_SL_EDIT",
+            OBJPROP_TEXT
+         )
+      );
+
+   double entered_risk =
+      StringToDouble(
+         ObjectGetString(
+            0,
+            "PSBM_RISK_EDIT",
+            OBJPROP_TEXT
+         )
+      );
+
+   if(entry <= 0.0 || stop <= 0.0 || entered_risk <= 0.0)
+   {
+      Alert("Trade not sent: check Risk and Stop Loss values.");
+      return;
+   }
+
+   entry = NormalizeDouble(entry, PriceDigits());
+   stop  = NormalizeDouble(stop, PriceDigits());
+
+   if(!ValidateBrokerStopDistance(order_type, entry, stop))
+   {
+      Alert(
+         "Trade not sent: invalid Stop Loss for ",
+         order_type == OP_BUY ? "BUY." : "SELL."
+      );
+      return;
+   }
+
+   risk_value = entered_risk;
+   GlobalVariableSet(GV_RISK_VALUE, risk_value);
+
+   double risk_amount = GetRiskAmount();
+   double one_lot_loss = GetPlannedLossPerLot(entry, stop);
+
+   if(risk_amount <= 0.0 || one_lot_loss <= 0.0)
+   {
+      Alert("Trade not sent: unable to calculate risk.");
+      return;
+   }
+
+   double raw_volume =
+      risk_amount / one_lot_loss;
+
+   double volume =
+      NormalizeExecutableVolume(raw_volume);
+
+   if(volume < 0.0)
+   {
+      Alert(
+         "Trade not sent: calculated lot size exceeds broker maximum."
+      );
+      return;
+   }
+
+   if(volume <= 0.0)
+   {
+      Alert(
+         "Trade not sent: calculated lot size is below broker minimum."
+      );
+      return;
+   }
+
+   double required_margin =
+      GetBrokerRequiredMargin(
+         order_type,
+         volume
+      );
+
+   if(required_margin > AccountFreeMargin())
+   {
+      Alert("Trade not sent: insufficient free margin.");
+      return;
+   }
+
+   // Update the panel with the exact values being used for execution.
+   ObjectSetString(
+      0,
+      "PSBM_ENTRY_EDIT",
+      OBJPROP_TEXT,
+      DoubleToString(entry, PriceDigits())
+   );
+
+   ObjectSetString(
+      0,
+      "PSBM_SL_EDIT",
+      OBJPROP_TEXT,
+      DoubleToString(stop, PriceDigits())
+   );
+
+   ObjectSetString(
+      0,
+      "PSBM_RISK_AMOUNT_VALUE",
+      OBJPROP_TEXT,
+      DoubleToString(risk_amount, 2)
+   );
+
+   ObjectSetString(
+      0,
+      "PSBM_CALCULATED_VALUE",
+      OBJPROP_TEXT,
+      DoubleToString(volume, 2)
+   );
+
+   ObjectSetString(
+      0,
+      "PSBM_MARGIN_VALUE",
+      OBJPROP_TEXT,
+      DoubleToString(required_margin, 2)
+   );
+
+   RefreshRates();
+
+   // Re-read the executable price immediately before sending and recalculate
+   // the lot size so a stale panel entry does not control the trade.
+   entry =
+      (order_type == OP_BUY)
+      ? CurrentAsk()
+      : CurrentBid();
+
+   entry = NormalizeDouble(entry, PriceDigits());
+
+   if(!ValidateBrokerStopDistance(order_type, entry, stop))
+   {
+      Alert("Trade not sent: price moved too close to the Stop Loss.");
+      return;
+   }
+
+   one_lot_loss = GetPlannedLossPerLot(entry, stop);
+
+   if(one_lot_loss <= 0.0)
+   {
+      Alert("Trade not sent: unable to recalculate current risk.");
+      return;
+   }
+
+   raw_volume = risk_amount / one_lot_loss;
+   volume = NormalizeExecutableVolume(raw_volume);
+
+   if(volume < 0.0)
+   {
+      Alert("Trade not sent: current calculated size exceeds broker maximum.");
+      return;
+   }
+
+   if(volume <= 0.0)
+   {
+      Alert("Trade not sent: current calculated size is below broker minimum.");
+      return;
+   }
+
+   int slippage_points = 10;
+
+   ResetLastError();
+
+   int ticket =
+      OrderSend(
+         Symbol(),
+         order_type,
+         volume,
+         entry,
+         slippage_points,
+         stop,
+         0,
+         "PSBM",
+         0,
+         0,
+         clrNONE
+      );
+
+   if(ticket < 0)
+   {
+      int error_code = GetLastError();
+
+      Print(
+         "PSBM OrderSend failed. Error ",
+         error_code
+      );
+
+      Alert(
+         "Trade not sent. MT4 error: ",
+         error_code
+      );
+
+      return;
+   }
+
+   // Read the broker-confirmed order values back into the panel.
+   if(OrderSelect(ticket, SELECT_BY_TICKET))
+   {
+      ObjectSetString(
+         0,
+         "PSBM_ENTRY_EDIT",
+         OBJPROP_TEXT,
+         DoubleToString(
+            OrderOpenPrice(),
+            PriceDigits()
+         )
+      );
+
+      ObjectSetString(
+         0,
+         "PSBM_SL_EDIT",
+         OBJPROP_TEXT,
+         DoubleToString(
+            OrderStopLoss(),
+            PriceDigits()
+         )
+      );
+
+      ObjectSetString(
+         0,
+         "PSBM_CALCULATED_VALUE",
+         OBJPROP_TEXT,
+         DoubleToString(
+            OrderLots(),
+            2
+         )
+      );
+   }
+
+   SyncStopLossLineWithoutSpread();
+   UpdatePanel();
+   ChartRedraw();
+}
+
+
 // ============================================================
 // SPREAD / PRICE
 // ============================================================
@@ -1272,66 +1610,56 @@ void CreateStopLossLine()
 
 }
 
+// ============================================================
+// STOP LOSS INPUT / LINE
+// ============================================================
+//
+// For panel-executed trades the Stop Loss field is the ACTUAL broker SL price.
+// We therefore do not add spread to the SL itself.
+//
+// Risk is calculated from the executable market side:
+// BUY  entry = Ask, risk distance = Ask - SL
+// SELL entry = Bid, risk distance = SL - Bid
+//
+// This naturally includes the Bid/Ask difference without shifting the broker SL.
 void UpdateStopLossFromLine()
 {
    if(
       !sl_line_enabled ||
-      ObjectFind(
-         0,
-         "PSBM_SL_LINE"
-      ) < 0
+      ObjectFind(0, "PSBM_SL_LINE") < 0
    )
       return;
 
-   // This is the exact price where the user dropped the line.
-   double dropped_price =
-      ObjectGetDouble(
-         0,
-         "PSBM_SL_LINE",
-         OBJPROP_PRICE1
-      );
-
-   // Apply the CURRENT spread once after the drag is completed.
-   double spread_price =
-      CurrentAsk() - CurrentBid();
-
-   if(spread_price < 0.0)
-      spread_price = 0.0;
-
-   double adjusted_price =
+   double stop =
       NormalizeDouble(
-         dropped_price + spread_price,
+         ObjectGetDouble(
+            0,
+            "PSBM_SL_LINE",
+            OBJPROP_PRICE1
+         ),
          PriceDigits()
       );
 
-   // Move the visual SL line to the spread-adjusted price.
-   ObjectSetDouble(
-      0,
-      "PSBM_SL_LINE",
-      OBJPROP_PRICE1,
-      adjusted_price
-   );
+   if(stop <= 0.0)
+      return;
 
-   // Keep the panel synchronized with the final adjusted price.
    ObjectSetString(
       0,
       "PSBM_SL_EDIT",
       OBJPROP_TEXT,
-      DoubleToString(
-         adjusted_price,
-         PriceDigits()
-      )
+      DoubleToString(stop, PriceDigits())
    );
 
    ChartRedraw();
 }
+
 
 void UpdateStopLossLineFromInput()
 {
    if(!sl_line_enabled)
       return;
 
-   double entered_price =
+   double stop =
       StringToDouble(
          ObjectGetString(
             0,
@@ -1340,51 +1668,31 @@ void UpdateStopLossLineFromInput()
          )
       );
 
-   if(entered_price <= 0.0)
+   if(stop <= 0.0)
       return;
 
-   // Automatically add the CURRENT spread to the SL price entered
-   // in the panel. Spread price = Ask - Bid.
-   double spread_price =
-      CurrentAsk() - CurrentBid();
+   stop = NormalizeDouble(stop, PriceDigits());
 
-   if(spread_price < 0.0)
-      spread_price = 0.0;
-
-   double adjusted_price =
-      NormalizeDouble(
-         entered_price + spread_price,
-         PriceDigits()
-      );
-
-   // Show the spread-adjusted SL in the panel as well.
    ObjectSetString(
       0,
       "PSBM_SL_EDIT",
       OBJPROP_TEXT,
-      DoubleToString(
-         adjusted_price,
-         PriceDigits()
-      )
+      DoubleToString(stop, PriceDigits())
    );
 
-   if(ObjectFind(
-      0,
-      "PSBM_SL_LINE"
-   ) < 0)
-   {
+   if(ObjectFind(0, "PSBM_SL_LINE") < 0)
       CreateStopLossLine();
-   }
 
    ObjectSetDouble(
       0,
       "PSBM_SL_LINE",
       OBJPROP_PRICE1,
-      adjusted_price
+      stop
    );
 
    ChartRedraw();
 }
+
 
 void UpdateSLButton()
 {
@@ -1572,7 +1880,7 @@ void CreatePanel()
    CreateRectangle(
       "PSBM_SIZER_BORDER",
       px + S(6), py + S(397),
-      pw - S(12), S(311),
+      pw - S(12), S(379),
       C'25,28,35', C'70,75,85'
    );
 
@@ -1786,20 +2094,50 @@ void CreatePanel()
                UnitX(), py + S(659), FontSize(BASE_FONT_SMALL), C'160,165,175');
 
    CreateButton(
-      "PSBM_CALCULATE_BUTTON",
-      "CALCULATE",
+      "PSBM_RISK_COSTS_BUTTON",
+      risk_includes_costs ? "RISK COSTS: ON" : "RISK COSTS: OFF",
       LabelX(),
       py + S(682),
       pw - S(22),
       S(21),
+      risk_includes_costs ? C'45,115,75' : C'80,80,85'
+   );
+
+   CreateButton(
+      "PSBM_CALCULATE_BUTTON",
+      "CALCULATE",
+      LabelX(),
+      py + S(708),
+      pw - S(22),
+      S(21),
       C'45,105,155'
+   );
+
+   CreateButton(
+      "PSBM_BUY_BUTTON",
+      "BUY",
+      LabelX(),
+      py + S(734),
+      S(132),
+      S(22),
+      C'45,115,75'
+   );
+
+   CreateButton(
+      "PSBM_SELL_BUTTON",
+      "SELL",
+      LabelX() + S(138),
+      py + S(734),
+      S(132),
+      S(22),
+      C'120,60,60'
    );
 
    CreateLabel(
       "PSBM_SIGNATURE",
       "By Tinashe Chimanikire",
       LabelX(),
-      py + S(708),
+      py + S(764),
       FontSize(BASE_FONT_SMALL),
       C'130,135,145'
    );
@@ -1815,7 +2153,7 @@ void SyncStopLossLineWithoutSpread()
    if(!sl_line_enabled)
       return;
 
-   double price =
+   double stop =
       StringToDouble(
          ObjectGetString(
             0,
@@ -1824,7 +2162,7 @@ void SyncStopLossLineWithoutSpread()
          )
       );
 
-   if(price <= 0.0)
+   if(stop <= 0.0)
       return;
 
    if(ObjectFind(0, "PSBM_SL_LINE") < 0)
@@ -1834,20 +2172,17 @@ void SyncStopLossLineWithoutSpread()
       0,
       "PSBM_SL_LINE",
       OBJPROP_PRICE1,
-      NormalizeDouble(
-         price,
-         PriceDigits()
-      )
+      NormalizeDouble(stop, PriceDigits())
    );
 
-   // The SL line remains red. Rebuilding/scrolling the panel must
-   // never apply the spread a second time.
    ObjectSetInteger(
       0,
       "PSBM_SL_LINE",
       OBJPROP_COLOR,
       clrRed
    );
+
+   ChartRedraw();
 }
 
 
@@ -2262,7 +2597,7 @@ void OnChartEvent(
          false
       );
 
-      manual_panel_scale -= 0.10;
+      manual_panel_scale -= 0.01;
 
       if(manual_panel_scale < 0.50)
          manual_panel_scale = 0.50;
@@ -2289,7 +2624,7 @@ void OnChartEvent(
          false
       );
 
-      manual_panel_scale += 0.10;
+      manual_panel_scale += 0.01;
 
       if(manual_panel_scale > 1.50)
          manual_panel_scale = 1.50;
@@ -2419,6 +2754,45 @@ void OnChartEvent(
 
       UpdateSLButton();
       ChartRedraw();
+      return;
+   }
+
+
+   // INCLUDE / EXCLUDE ESTIMATED COMMISSION FROM TOTAL RISK
+   if(sparam == "PSBM_RISK_COSTS_BUTTON")
+   {
+      ObjectSetInteger(0,sparam,OBJPROP_STATE,false);
+      risk_includes_costs=!risk_includes_costs;
+
+      ObjectSetString(
+         0,"PSBM_RISK_COSTS_BUTTON",OBJPROP_TEXT,
+         risk_includes_costs ? "RISK COSTS: ON" : "RISK COSTS: OFF"
+      );
+
+      ObjectSetInteger(
+         0,"PSBM_RISK_COSTS_BUTTON",OBJPROP_BGCOLOR,
+         risk_includes_costs ? C'45,115,75' : C'80,80,85'
+      );
+
+      ChartRedraw();
+      return;
+   }
+
+
+   // EXECUTE BUY FROM PANEL
+   if(sparam == "PSBM_BUY_BUTTON")
+   {
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      ExecutePanelTrade(OP_BUY);
+      return;
+   }
+
+
+   // EXECUTE SELL FROM PANEL
+   if(sparam == "PSBM_SELL_BUTTON")
+   {
+      ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+      ExecutePanelTrade(OP_SELL);
       return;
    }
 
